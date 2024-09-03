@@ -1,1 +1,403 @@
-{"nbformat":4,"nbformat_minor":0,"metadata":{"colab":{"provenance":[],"machine_shape":"hm","gpuType":"V28","mount_file_id":"1UDKO09tCO953ylGrSTy0ZyhN3-TCvquJ","authorship_tag":"ABX9TyMeL0Vk/kJasGfKgS2SNgfo"},"kernelspec":{"name":"python3","display_name":"Python 3"},"language_info":{"name":"python"},"accelerator":"TPU"},"cells":[{"cell_type":"code","execution_count":null,"metadata":{"id":"ukW6M_r9KiyB"},"outputs":[],"source":["import numpy as np\n","import pandas as pd\n","import transformers\n","import sklearn.metrics\n","from huggingface_hub import notebook_login\n","import datasets\n","import tensorflow as tf\n","import torch\n","import torch.nn as nn\n","import keras\n","import matplotlib.pyplot as plt\n","from torch.optim.lr_scheduler import CosineAnnealingLR\n","from PIL import Image\n","import pickle\n","\n","\n","torch.manual_seed(42)\n","np.random.seed(42)\n","\n","# Loading Foundation Model\n","model_name = \"openai/clip-vit-base-patch32\"\n","FM = transformers.CLIPModel.from_pretrained(model_name)\n","processor = transformers.CLIPProcessor.from_pretrained(model_name)\n","tokenizer = transformers.AutoTokenizer.from_pretrained(model_name)\n","\n","\n","\n","def ddf(x):\n","    x = datasets.Dataset.from_dict(x)\n","    x.set_format(\"torch\")\n","    return x\n","\n","def shuffling(a, b):\n","    return np.random.randint(0, a, b)\n","\n","def normalization(batch):\n","    normal_image = batch[\"img\"] / 255\n","    return {\"img\": normal_image, \"label\": batch[\"label\"]}\n","\n","def data_distributing(num_clients, bigdata, gamma):\n","    train_data = ddf(bigdata['train'][:40000])\n","    public_data = ddf(bigdata['train'][40000:])\n","    test_data = ddf(bigdata[\"test\"][:])\n","    Ds = []\n","    samples = np.random.dirichlet(np.ones(num_classes)*gamma, size=num_clients)\n","    num_samples = np.array(samples*int(len(train_data)/num_clients))\n","    num_samples = num_samples.astype(int)\n","    print(num_samples)\n","    for i in range(num_clients):\n","        idxs = []\n","        for c in range(num_classes):\n","            idxs.extend( np.random.choice( np.where(train_data[\"label\"]==c)[0], num_samples[i][c] ) )\n","        train_data_client = train_data[idxs]\n","        client_data = datasets.DatasetDict({  \"train\": ddf(train_data_client),  \"test\": test_data  })\n","        Ds.append(client_data)\n","    server_data = datasets.DatasetDict({ \"test\": test_data  })\n","    Ds.append(server_data)\n","    return Ds, public_data\n","\n","num_train_samples = 45000\n","num_test_samples = 1000\n","\n","# Loading Dataset\n","loaded_dataset = datasets.load_dataset(\"cifar10\", split=['train[:100%]', 'test[:100%]'])\n","num_classes = loaded_dataset[0].features[\"label\"].num_classes\n","name_classes = [\"{}\".format(name) for name in loaded_dataset[0].features[\"label\"].names]\n","Dataset1 = datasets.DatasetDict({   \"train\":ddf(loaded_dataset[0][shuffling(loaded_dataset[0].num_rows, num_train_samples)]),\"test\":ddf(loaded_dataset[1][shuffling(loaded_dataset[1].num_rows, num_test_samples)])   })\n","Dataset = datasets.DatasetDict({\"train\": ddf({'img': Dataset1[\"train\"][\"img\"], 'label': Dataset1[\"train\"][\"label\"]}),\\\n","                                 \"test\":  ddf({'img': Dataset1[\"test\"][\"img\"], 'label': Dataset1[\"test\"][\"label\"]})  })\n","\n","Dataset.set_format(\"torch\", columns=[\"img\", \"label\"])\n","Dataset = Dataset.map(normalization, batched=True)\n","\n","gamma = 10 # The parameter of Dirichlet distribution\n","Ds, public_data = data_distributing(10, Dataset, gamma)\n","\n","\n","\n","\n","class VGGBlock(nn.Module):\n","    def __init__(self, in_channels, out_channels):\n","        super(VGGBlock, self).__init__()\n","        self.conv1 = nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1)\n","        self.conv2 = nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1)\n","        self.pool = nn.MaxPool2d(kernel_size=2, stride=2)\n","    def forward(self, x):\n","        x = nn.functional.relu(self.conv1(x))\n","        x = nn.functional.relu(self.conv2(x))\n","        x = self.pool(x)\n","        return x\n","\n","class LightWeight_CNN(nn.Module):\n","    def __init__(self, input_shape, output_shape, num_vcg):\n","        super().__init__()\n","        self.num_vcg = num_vcg\n","        self.vgg_block1 = VGGBlock(input_shape[0], 32)\n","        self.vgg_block2 = VGGBlock(32, 64)\n","        self.vgg_block3 = VGGBlock(64, 64)\n","        if self.num_vcg==1: self.fc1 = nn.Linear(int(input_shape[1]*input_shape[2]*32/4), 512)\n","        elif self.num_vcg==2: self.fc1 = nn.Linear(int(input_shape[1]*input_shape[2]*64/16), 512)\n","        elif self.num_vcg==3: self.fc1 = nn.Linear(int(input_shape[1]*input_shape[2]*64/64), 512)\n","        self.fc2 = nn.Linear(512, 128)\n","        self.fc3 = nn.Linear(128, 10)\n","    def forward(self, x):\n","        if self.num_vcg>=1:\n","            x = self.vgg_block1(x)\n","            if self.num_vcg>=2:\n","                x = self.vgg_block2(x)\n","                if self.num_vcg>=3:\n","                    x = self.vgg_block3(x)\n","        x = x.view(x.size(0), -1)\n","        x = nn.functional.relu(self.fc1(x))\n","        x = nn.functional.relu(self.fc2(x))\n","        x = self.fc3(x)\n","        return x\n","\n","def adjust_temperature(p, T):\n","    modified_p = torch.zeros_like(p)\n","    for i in range(p.shape[0]):\n","        row = p[i]\n","        scaled_row = torch.pow(row, 1 / T)\n","        normalized_row = scaled_row / scaled_row.sum()\n","        modified_p[i] = normalized_row\n","    return modified_p\n","\n","class Prompt_Tuning_Model(torch.nn.Module):\n","  def __init__(self):\n","    super(Prompt_Tuning_Model, self).__init__()\n","    self.FM = FM\n","    for param in self.FM.parameters(): param.requires_grad = False\n","    self.num_prompts = num_prompts\n","    self.num_classes = num_classes\n","    self.name_classes = name_classes\n","    self.embedding_lookup_table = self.FM.text_model.embeddings\n","    self.ctx = torch.nn.Parameter(torch.nn.init.normal_(torch.empty(self.num_prompts, self.FM.config.text_config.hidden_size), std=0.02))\n","    self.ctx = torch.load(\"prompt.pt\", weights_only=True)\n","    self.build_token_embeds()\n","    self.logit_scale = torch.nn.Parameter(torch.tensor(self.FM.config.logit_scale_init_value))\n","    self.Loss = []\n","    self.Acc = []\n","    self.test_Acc = []\n","  def build_token_embeds(self):\n","    self.tokens = tokenizer(name_classes, add_special_tokens=True, padding=True, return_tensors=\"pt\")[\"input_ids\"]\n","    with torch.no_grad():\n","        self.token_embeds = self.embedding_lookup_table(self.tokens)\n","  def prepare_prompt(self):\n","    ctx = torch.unsqueeze(self.ctx, dim=0)\n","    ctx = torch.broadcast_to(ctx, [self.num_classes, ctx.shape[-2], ctx.shape[-1]])\n","    self.prompts = torch.cat([self.token_embeds[:, :1, :], ctx, self.token_embeds[:, 1:, :]], dim=1)\n","  def customize_images(self, imgs):\n","    if imgs.shape[1]==1: imgs = imgs.repeat(1,3,1,1)\n","    return processor( images=imgs, return_tensors=\"pt\", padding=True, do_rescale=False)['pixel_values']\n","  def __call__(self, images):\n","    self.prepare_prompt()\n","    output = self.FM.text_model.encoder(inputs_embeds = self.prompts)\n","    last_hidden_state = self.FM.text_model.final_layer_norm(output[0])\n","    pooled_output = last_hidden_state[torch.arange(last_hidden_state.shape[0]),  self.tokens.argmax(dim=-1)]\n","    text_rep = FM.text_projection(pooled_output)\n","\n","\n","    images = self.customize_images(images)\n","    img_rep = self.FM.get_image_features(images)\n","\n","    img_rep = img_rep / img_rep.norm(p=2, dim=-1, keepdim=True)\n","    text_rep = text_rep / text_rep.norm(p=2, dim=-1, keepdim=True)\n","\n","    logit_scale = self.logit_scale.exp()\n","    logits = logit_scale * img_rep @ text_rep.t()\n","    soft_labels = torch.nn.functional.softmax(logits, dim=1)\n","    return soft_labels\n","\n","\n","class Server():\n","    def __init__(self, clients, data):\n","        self.data = data\n","        self.clients = clients\n","        self.p_model = Prompt_Tuning_Model()\n","        self.Optimizer = torch.optim.Adam(self.p_model.parameters(),  lr=learning_rate)\n","        self.scheduler = CosineAnnealingLR(self.Optimizer, T_max=100, eta_min=0)\n","        self.Loss = []\n","        self.Acc = []\n","        #print(\"zero shot accuracy:\")\n","        #self.evaluate()\n","    def evaluate(self):\n","        imgs = self.data['test']['img']\n","        labels = self.data['test']['label']\n","        pred = self.p_model(imgs)\n","        acc = 0\n","        for i in range(len(labels)):\n","            if np.argmax(pred[i].detach().numpy()) == labels[i]: acc+=1\n","        print(\"Accuracy: \", acc*100/len(labels))\n","        self.Acc.append( acc*100/len(labels) )\n","    def aggregation(self, subset ):\n","        logits = torch.stack( [ nn.functional.softmax(client.model(subset[\"img\"]), dim=-1) for client in clients], dim=0)\n","        self.agg_soft_label = torch.mean(logits, dim=0)\n","    def get_global_knowledge(self, subset):\n","        imgs = subset['img']\n","        pred = self.p_model(imgs)\n","        self.global_knowledge = torch.nn.functional.softmax(pred, dim=1)\n","        return self.global_knowledge\n","    def prompt_tuning(self, subset):\n","        sl_data = ddf({ \"img\":subset['img'], \"label\":subset['label'] , \"agg_soft_label\":self.agg_soft_label  })\n","        dataset = torch.utils.data.DataLoader(sl_data, batch_size=server_batch_size, shuffle=True)\n","        epoch_loss = []\n","        for epoch in range(server_epochs):\n","            batch_loss = []\n","            self.p_model.train()\n","            for batch in dataset:\n","                self.Optimizer.zero_grad()\n","                pred = self.p_model( batch['img'] )\n","                t = adjust_temperature(batch[\"agg_soft_label\"], temp_fm)\n","                s = nn.functional.log_softmax(pred/temp_client , dim=-1)\n","                error1 = torch.nn.functional.cross_entropy(pred, batch[\"label\"])\n","                error2 = (temp**2)*nn.KLDivLoss( reduction='batchmean')(s, t)\n","                error = error1 + error2\n","                error.backward()\n","                self.Optimizer.step()\n","                batch_loss.append(float(error))\n","            self.scheduler.step()\n","            epoch_loss.append(np.mean(batch_loss))\n","            self.Loss.append(np.mean(batch_loss))\n","        self.evaluate()\n","    def FSL_data_preparing(self): #Few-Shot Learning data preparing\n","        labels = subset[\"label\"].detach().numpy()\n","        samples = subset[\"img\"].detach().numpy()\n","        classes = list(set(labels))\n","        new_samples = []\n","        new_labels = []\n","        for cls in classes :\n","            ins = np.where(np.array(labels)==cls)[0]\n","            ins = ins[ : min(num_shots, len(ins))]\n","            for i in ins:\n","                new_samples.append(samples[i])\n","                new_labels.append(cls)\n","        return  torch.tensor(new_samples),  torch.tensor(new_labels)\n","    def pre_prompt_tuning(self):\n","        new_samples, new_labels = self.FSL_data_preparing()\n","        sl_data = ddf({ \"img\":new_samples, \"label\":new_labels })\n","        dataset = torch.utils.data.DataLoader(sl_data, batch_size=server_batch_size, shuffle=True)\n","        epoch_loss = []\n","        for epoch in range(server_epochs):\n","            batch_loss = []\n","            self.p_model.train()\n","            for batch in dataset:\n","                self.Optimizer.zero_grad()\n","                pred = self.p_model( batch['img'] )\n","                error = torch.nn.functional.cross_entropy(pred, batch[\"label\"])\n","                error.backward()\n","                self.Optimizer.step()\n","                batch_loss.append(float(error))\n","            self.scheduler.step()\n","            epoch_loss.append(np.mean(batch_loss))\n","            self.Loss.append(np.mean(batch_loss))\n","            self.evaluate()\n","\n","\n","class Device():\n","    def __init__(self, id, data, num_vcg):\n","        self.id = id\n","        self.data = data\n","        input_shape = self.data['train']['img'][0].shape\n","        self.model = LightWeight_CNN(input_shape, num_classes, num_vcg)\n","        self.Optimizer = torch.optim.Adam(self.model.parameters(),  lr=learning_rate)\n","        self.scheduler = CosineAnnealingLR(self.Optimizer, T_max=100, eta_min=0)\n","        self.Loss = []\n","        self.Acc = []\n","    def evaluate(self):\n","        imgs = self.data['test']['img']\n","        labels = self.data['test']['label']\n","        pred = self.model(imgs)\n","        acc = 0\n","        for i in range(len(labels)):\n","            if np.argmax(pred[i].detach().numpy()) == labels[i]: acc+=1\n","        print(\"Accuracy: \", acc*100/len(labels))\n","        self.Acc.append( acc*100/len(labels) )\n","    def cal_softlabels(self):\n","        imgs = self.data['public']['img']\n","        pred = self.model(imgs)\n","        self.soft_labels = torch.nn.functional.softmax(pred, dim=1)\n","    def distillation(self, subset, global_knowledge):\n","        sl_data = ddf({   \"img\":subset['img'], \"label\":subset['label'], \"global_knowledge\":global_knowledge    })\n","        dataset = torch.utils.data.DataLoader(sl_data, batch_size=distil_batch_size, shuffle=True)\n","        epoch_loss = []\n","        for epoch in range(distil_epochs):\n","            batch_loss = []\n","            self.model.train()\n","            for batch in dataset:\n","                self.Optimizer.zero_grad()\n","                pred = self.model( batch['img'] )\n","                t = adjust_temperature(batch[\"global_knowledge\"], temp_fm)\n","                s = nn.functional.log_softmax(pred/temp_client , dim=-1)\n","                error1 = torch.nn.functional.cross_entropy(pred, batch[\"label\"])\n","                error2 = (temp**2)*nn.KLDivLoss( reduction='batchmean')(s, t)\n","                error = error1 + error2\n","                error.backward()\n","                self.Optimizer.step()\n","                batch_loss.append(float(error))\n","            self.scheduler.step()\n","            self.evaluate()\n","    def preparation(self, subset):\n","        dataset = torch.utils.data.DataLoader(subset, batch_size=pre_batch_size, shuffle=True)\n","        epoch_loss = []\n","        for epoch in range(pre_epochs):\n","            batch_loss = []\n","            self.model.train()\n","            for batch in dataset:\n","                self.Optimizer.zero_grad()\n","                pred = self.model( batch['img'] )\n","                error = torch.nn.functional.cross_entropy(pred, batch[\"label\"])\n","                error.backward()\n","                self.Optimizer.step()\n","                batch_loss.append(float(error))\n","            self.scheduler.step()\n","            epoch_loss.append(np.mean(batch_loss))\n","            self.Loss.append(np.mean(batch_loss))\n","            self.evaluate()\n","    def local_training(self):\n","        dataset = torch.utils.data.DataLoader(self.data[\"train\"], batch_size=local_batch_size, shuffle=True)\n","        epoch_loss = []\n","        for epoch in range(local_epochs):\n","            batch_loss = []\n","            self.model.train()\n","            for batch in dataset:\n","                self.Optimizer.zero_grad()\n","                pred = self.model( batch['img'] )\n","                error = torch.nn.functional.cross_entropy(pred, batch[\"label\"])\n","                error.backward()\n","                self.Optimizer.step()\n","                batch_loss.append(float(error))\n","            self.scheduler.step()\n","            epoch_loss.append(np.mean(batch_loss))\n","            self.Loss.append(np.mean(batch_loss))\n","            #print(f\"Loss of epoch {epoch}: {epoch_loss[-1]}\")\n","            self.evaluate()\n","\n","rounds = 20\n","num_clients = 10\n","\n","pre_epochs = 20\n","pre_batch_size = 256\n","\n","distil_epochs = 1\n","distil_batch_size = 32\n","\n","local_epochs = 1\n","local_batch_size = 16\n","\n","server_epochs = 4\n","server_batch_size = 256\n","num_prompts = 4\n","num_shots = 8\n","\n","learning_rate = 0.001\n","temp_fm = .1\n","temp_client = 10\n","\n","clients = [Device(id, Ds[id], 3) for id in range(num_clients)]\n","server = Server(clients, Ds[-1])\n","\n","subset = ddf(public_data[np.random.randint(0, len(public_data[\"label\"]), 1000)])\n","\n","\n","for client in clients:\n","    client.preparation(subset)\n","    client.local_training()\n","\n","server.pre_prompt_tuning()\n","\n","\n","for round in range(rounds):\n","    print(\"*\"*50, \"Round: {}\".format(round) ,\"*\"*50)\n","\n","    print(\"=\"*50 ,\"Prompt Tuning Phase\", \"\"*50)\n","    server.aggregation(subset)\n","    #server.prompt_tuning(subset)\n","\n","    print(\"=\"*50 ,\"Local Distillation Phase\", \"=\"*50)\n","    global_knowledge = server.get_global_knowledge(subset)\n","    for client in clients:\n","        print(\"-\"*30 ,\"Client {} knowledge distillation\".format(client.id), \"-\"*30)\n","        client.distillation(subset, global_knowledge) #FedD2P\n","        #client.distillation(subset, server.agg_soft_label) #FedMD\n","        #client.preparation(subset) #Local\n","\n","    print(\"=\"*50 ,\"Local Training Phase\", \"=\"*50)\n","    for client in clients:\n","        print(\"-\"*30 ,\"Client {} local training\".format(client.id), \"-\"*30)\n","        client.local_training()\n","\n","\n","\n","S = [client.Acc for client in clients]\n","\n","with open(\"S.pkl\", \"wb\") as file:\n","    pickle.dump(S, file)\n"]}]}
+# -*- coding: utf-8 -*-
+"""Whitepaper.py
+
+Automatically generated by Colab.
+
+Original file is located at
+    https://colab.research.google.com/drive/1UDKO09tCO953ylGrSTy0ZyhN3-TCvquJ
+"""
+
+import numpy as np
+import pandas as pd
+import transformers
+import sklearn.metrics
+from huggingface_hub import notebook_login
+import datasets
+import tensorflow as tf
+import torch
+import torch.nn as nn
+import keras
+import matplotlib.pyplot as plt
+from torch.optim.lr_scheduler import CosineAnnealingLR
+from PIL import Image
+import pickle
+
+
+torch.manual_seed(42)
+np.random.seed(42)
+
+# Loading Foundation Model
+model_name = "openai/clip-vit-base-patch32"
+FM = transformers.CLIPModel.from_pretrained(model_name)
+processor = transformers.CLIPProcessor.from_pretrained(model_name)
+tokenizer = transformers.AutoTokenizer.from_pretrained(model_name)
+
+
+
+def ddf(x):
+    x = datasets.Dataset.from_dict(x)
+    x.set_format("torch")
+    return x
+
+def shuffling(a, b):
+    return np.random.randint(0, a, b)
+
+def normalization(batch):
+    normal_image = batch["img"] / 255
+    return {"img": normal_image, "label": batch["label"]}
+
+def data_distributing(num_clients, bigdata, gamma):
+    train_data = ddf(bigdata['train'][:40000])
+    public_data = ddf(bigdata['train'][40000:])
+    test_data = ddf(bigdata["test"][:])
+    Ds = []
+    samples = np.random.dirichlet(np.ones(num_classes)*gamma, size=num_clients)
+    num_samples = np.array(samples*int(len(train_data)/num_clients))
+    num_samples = num_samples.astype(int)
+    print(num_samples)
+    for i in range(num_clients):
+        idxs = []
+        for c in range(num_classes):
+            idxs.extend( np.random.choice( np.where(train_data["label"]==c)[0], num_samples[i][c] ) )
+        train_data_client = train_data[idxs]
+        client_data = datasets.DatasetDict({  "train": ddf(train_data_client),  "test": test_data  })
+        Ds.append(client_data)
+    server_data = datasets.DatasetDict({ "test": test_data  })
+    Ds.append(server_data)
+    return Ds, public_data
+
+num_train_samples = 45000
+num_test_samples = 1000
+
+# Loading Dataset
+loaded_dataset = datasets.load_dataset("cifar10", split=['train[:100%]', 'test[:100%]'])
+num_classes = loaded_dataset[0].features["label"].num_classes
+name_classes = ["{}".format(name) for name in loaded_dataset[0].features["label"].names]
+Dataset1 = datasets.DatasetDict({   "train":ddf(loaded_dataset[0][shuffling(loaded_dataset[0].num_rows, num_train_samples)]),"test":ddf(loaded_dataset[1][shuffling(loaded_dataset[1].num_rows, num_test_samples)])   })
+Dataset = datasets.DatasetDict({"train": ddf({'img': Dataset1["train"]["img"], 'label': Dataset1["train"]["label"]}),\
+                                 "test":  ddf({'img': Dataset1["test"]["img"], 'label': Dataset1["test"]["label"]})  })
+
+Dataset.set_format("torch", columns=["img", "label"])
+Dataset = Dataset.map(normalization, batched=True)
+
+gamma = 10 # The parameter of Dirichlet distribution
+Ds, public_data = data_distributing(10, Dataset, gamma)
+
+
+
+
+class VGGBlock(nn.Module):
+    def __init__(self, in_channels, out_channels):
+        super(VGGBlock, self).__init__()
+        self.conv1 = nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1)
+        self.conv2 = nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1)
+        self.pool = nn.MaxPool2d(kernel_size=2, stride=2)
+    def forward(self, x):
+        x = nn.functional.relu(self.conv1(x))
+        x = nn.functional.relu(self.conv2(x))
+        x = self.pool(x)
+        return x
+
+class LightWeight_CNN(nn.Module):
+    def __init__(self, input_shape, output_shape, num_vcg):
+        super().__init__()
+        self.num_vcg = num_vcg
+        self.vgg_block1 = VGGBlock(input_shape[0], 64)
+        self.vgg_block2 = VGGBlock(64, 64)
+        self.vgg_block3 = VGGBlock(64, 128)
+        if self.num_vcg==1: self.fc1 = nn.Linear(int(input_shape[1]*input_shape[2]*64/4), 512)
+        elif self.num_vcg==2: self.fc1 = nn.Linear(int(input_shape[1]*input_shape[2]*64/16), 512)
+        elif self.num_vcg==3: self.fc1 = nn.Linear(int(input_shape[1]*input_shape[2]*128/64), 512)
+        self.fc2 = nn.Linear(512, 128)
+        self.fc3 = nn.Linear(128, 10)
+    def forward(self, x):
+        if self.num_vcg>=1:
+            x = self.vgg_block1(x)
+            if self.num_vcg>=2:
+                x = self.vgg_block2(x)
+                if self.num_vcg>=3:
+                    x = self.vgg_block3(x)
+        x = x.view(x.size(0), -1)
+        x = nn.functional.relu(self.fc1(x))
+        x = nn.functional.relu(self.fc2(x))
+        x = self.fc3(x)
+        return x
+
+def adjust_temperature(p, T):
+    modified_p = torch.zeros_like(p)
+    for i in range(p.shape[0]):
+        row = p[i]
+        scaled_row = torch.pow(row, 1 / T)
+        normalized_row = scaled_row / scaled_row.sum()
+        modified_p[i] = normalized_row
+    return modified_p
+
+class Prompt_Tuning_Model(torch.nn.Module):
+  def __init__(self):
+    super(Prompt_Tuning_Model, self).__init__()
+    self.FM = FM
+    for param in self.FM.parameters(): param.requires_grad = False
+    self.num_prompts = num_prompts
+    self.num_classes = num_classes
+    self.name_classes = name_classes
+    self.embedding_lookup_table = self.FM.text_model.embeddings
+    self.ctx = torch.nn.Parameter(torch.nn.init.normal_(torch.empty(self.num_prompts, self.FM.config.text_config.hidden_size), std=0.02))
+    self.build_token_embeds()
+    self.logit_scale = torch.nn.Parameter(torch.tensor(self.FM.config.logit_scale_init_value))
+    self.Loss = []
+    self.Acc = []
+    self.test_Acc = []
+  def build_token_embeds(self):
+    self.tokens = tokenizer(name_classes, add_special_tokens=True, padding=True, return_tensors="pt")["input_ids"]
+    with torch.no_grad():
+        self.token_embeds = self.embedding_lookup_table(self.tokens)
+  def prepare_prompt(self):
+    ctx = torch.unsqueeze(self.ctx, dim=0)
+    ctx = torch.broadcast_to(ctx, [self.num_classes, ctx.shape[-2], ctx.shape[-1]])
+    self.prompts = torch.cat([self.token_embeds[:, :1, :], ctx, self.token_embeds[:, 1:, :]], dim=1)
+  def customize_images(self, imgs):
+    if imgs.shape[1]==1: imgs = imgs.repeat(1,3,1,1)
+    return processor( images=imgs, return_tensors="pt", padding=True, do_rescale=False)['pixel_values']
+  def __call__(self, images):
+    self.prepare_prompt()
+    output = self.FM.text_model.encoder(inputs_embeds = self.prompts)
+    last_hidden_state = self.FM.text_model.final_layer_norm(output[0])
+    pooled_output = last_hidden_state[torch.arange(last_hidden_state.shape[0]),  self.tokens.argmax(dim=-1)]
+    text_rep = FM.text_projection(pooled_output)
+
+
+    images = self.customize_images(images)
+    img_rep = self.FM.get_image_features(images)
+
+    img_rep = img_rep / img_rep.norm(p=2, dim=-1, keepdim=True)
+    text_rep = text_rep / text_rep.norm(p=2, dim=-1, keepdim=True)
+
+    logit_scale = self.logit_scale.exp()
+    logits = logit_scale * img_rep @ text_rep.t()
+    soft_labels = torch.nn.functional.softmax(logits, dim=1)
+    return soft_labels
+
+
+class Server():
+    def __init__(self, clients, data):
+        self.data = data
+        self.clients = clients
+        self.p_model = Prompt_Tuning_Model()
+        self.Optimizer = torch.optim.Adam(self.p_model.parameters(),  lr=learning_rate)
+        self.scheduler = CosineAnnealingLR(self.Optimizer, T_max=100, eta_min=0)
+        self.Loss = []
+        self.Acc = []
+        #print("zero shot accuracy:")
+        #self.evaluate()
+    def evaluate(self):
+        imgs = self.data['test']['img']
+        labels = self.data['test']['label']
+        pred = self.p_model(imgs)
+        acc = 0
+        for i in range(len(labels)):
+            if np.argmax(pred[i].detach().numpy()) == labels[i]: acc+=1
+        print("Accuracy: ", acc*100/len(labels))
+        self.Acc.append( acc*100/len(labels) )
+    def aggregation(self, subset ):
+        logits = torch.stack( [ nn.functional.softmax(client.model(subset["img"]), dim=-1) for client in clients], dim=0)
+        self.agg_soft_label = torch.mean(logits, dim=0)
+    def get_global_knowledge(self, subset):
+        imgs = subset['img']
+        pred = self.p_model(imgs)
+        self.global_knowledge = torch.nn.functional.softmax(pred, dim=1)
+        return self.global_knowledge
+    def prompt_tuning(self, subset):
+        sl_data = ddf({ "img":subset['img'], "label":subset['label'] , "agg_soft_label":self.agg_soft_label  })
+        dataset = torch.utils.data.DataLoader(sl_data, batch_size=server_batch_size, shuffle=True)
+        epoch_loss = []
+        for epoch in range(server_epochs):
+            batch_loss = []
+            self.p_model.train()
+            for batch in dataset:
+                self.Optimizer.zero_grad()
+                pred = self.p_model( batch['img'] )
+                t = adjust_temperature(batch["agg_soft_label"], temp_client)
+                s = nn.functional.log_softmax(pred/temp_fm , dim=-1)
+                error1 = torch.nn.functional.cross_entropy(pred, batch["label"])
+                error2 = nn.KLDivLoss( reduction='batchmean')(s, t)
+                error = error1 + error2
+                error.backward()
+                self.Optimizer.step()
+                batch_loss.append(float(error))
+            self.scheduler.step()
+            epoch_loss.append(np.mean(batch_loss))
+            self.Loss.append(np.mean(batch_loss))
+        self.evaluate()
+    def FSL_data_preparing(self): #Few-Shot Learning data preparing
+        labels = subset["label"].detach().numpy()
+        samples = subset["img"].detach().numpy()
+        classes = list(set(labels))
+        new_samples = []
+        new_labels = []
+        for cls in classes :
+            ins = np.where(np.array(labels)==cls)[0]
+            ins = ins[ : min(num_shots, len(ins))]
+            for i in ins:
+                new_samples.append(samples[i])
+                new_labels.append(cls)
+        return  torch.tensor(new_samples),  torch.tensor(new_labels)
+    def pre_prompt_tuning(self):
+        new_samples, new_labels = self.FSL_data_preparing()
+        sl_data = ddf({ "img":new_samples, "label":new_labels })
+        dataset = torch.utils.data.DataLoader(sl_data, batch_size=server_batch_size, shuffle=True)
+        epoch_loss = []
+        for epoch in range(server_epochs):
+            batch_loss = []
+            self.p_model.train()
+            for batch in dataset:
+                self.Optimizer.zero_grad()
+                pred = self.p_model( batch['img'] )
+                error = torch.nn.functional.cross_entropy(pred, batch["label"])
+                error.backward()
+                self.Optimizer.step()
+                batch_loss.append(float(error))
+            self.scheduler.step()
+            epoch_loss.append(np.mean(batch_loss))
+            self.Loss.append(np.mean(batch_loss))
+            self.evaluate()
+
+
+class Device():
+    def __init__(self, id, data, num_vcg):
+        self.id = id
+        self.data = data
+        input_shape = self.data['train']['img'][0].shape
+        self.model = LightWeight_CNN(input_shape, num_classes, num_vcg)
+        self.Optimizer = torch.optim.Adam(self.model.parameters(),  lr=learning_rate)
+        self.scheduler = CosineAnnealingLR(self.Optimizer, T_max=100, eta_min=0)
+        self.Loss = []
+        self.Acc = []
+    def evaluate(self):
+        imgs = self.data['test']['img']
+        labels = self.data['test']['label']
+        pred = self.model(imgs)
+        acc = 0
+        for i in range(len(labels)):
+            if np.argmax(pred[i].detach().numpy()) == labels[i]: acc+=1
+        print("Accuracy: ", acc*100/len(labels))
+        self.Acc.append( acc*100/len(labels) )
+    def cal_softlabels(self):
+        imgs = self.data['public']['img']
+        pred = self.model(imgs)
+        self.soft_labels = torch.nn.functional.softmax(pred, dim=1)
+    def distillation(self, subset, global_knowledge):
+        sl_data = ddf({   "img":subset['img'], "label":subset['label'], "global_knowledge":global_knowledge    })
+        dataset = torch.utils.data.DataLoader(sl_data, batch_size=distil_batch_size, shuffle=True)
+        epoch_loss = []
+        for epoch in range(distil_epochs):
+            batch_loss = []
+            self.model.train()
+            for batch in dataset:
+                self.Optimizer.zero_grad()
+                pred = self.model( batch['img'] )
+                t = adjust_temperature(batch["global_knowledge"], temp_fm)
+                s = nn.functional.log_softmax(pred/temp_client , dim=-1)
+                error1 = torch.nn.functional.cross_entropy(pred, batch["label"])
+                error2 = (temp_client**2)*nn.KLDivLoss( reduction='batchmean')(s, t)
+                error = error1 + error2
+                error.backward()
+                self.Optimizer.step()
+                batch_loss.append(float(error))
+            self.scheduler.step()
+            self.evaluate()
+    def preparation(self, subset):
+        dataset = torch.utils.data.DataLoader(subset, batch_size=pre_batch_size, shuffle=True)
+        epoch_loss = []
+        for epoch in range(pre_epochs):
+            batch_loss = []
+            self.model.train()
+            for batch in dataset:
+                self.Optimizer.zero_grad()
+                pred = self.model( batch['img'] )
+                error = torch.nn.functional.cross_entropy(pred, batch["label"])
+                error.backward()
+                self.Optimizer.step()
+                batch_loss.append(float(error))
+            self.scheduler.step()
+            epoch_loss.append(np.mean(batch_loss))
+            self.Loss.append(np.mean(batch_loss))
+            self.evaluate()
+    def local_training(self):
+        dataset = torch.utils.data.DataLoader(self.data["train"], batch_size=local_batch_size, shuffle=True)
+        epoch_loss = []
+        for epoch in range(local_epochs):
+            batch_loss = []
+            self.model.train()
+            for batch in dataset:
+                self.Optimizer.zero_grad()
+                pred = self.model( batch['img'] )
+                error = torch.nn.functional.cross_entropy(pred, batch["label"])
+                error.backward()
+                self.Optimizer.step()
+                batch_loss.append(float(error))
+            self.scheduler.step()
+            epoch_loss.append(np.mean(batch_loss))
+            self.Loss.append(np.mean(batch_loss))
+            #print(f"Loss of epoch {epoch}: {epoch_loss[-1]}")
+            self.evaluate()
+
+rounds = 20
+num_clients = 10
+
+pre_epochs = 20
+pre_batch_size = 256
+
+distil_epochs = 1
+distil_batch_size = 32
+
+local_epochs = 1
+local_batch_size = 16
+
+server_epochs = 4
+server_batch_size = 256
+num_prompts = 4
+num_shots = 8
+
+learning_rate = 0.001
+temp_fm = .1
+temp_client = 10
+
+clients = [Device(id, Ds[id], 3) for id in range(num_clients)]
+server = Server(clients, Ds[-1])
+
+subset = ddf(public_data[np.random.randint(0, len(public_data["label"]), 1000)])
+
+
+for client in clients:
+    client.preparation(subset)
+    client.local_training()
+
+server.pre_prompt_tuning()
+
+
+for round in range(rounds):
+    print("*"*50, "Round: {}".format(round) ,"*"*50)
+
+    print("="*50 ,"Prompt Tuning Phase", ""*50)
+    server.aggregation(subset)
+    server.prompt_tuning(subset)
+
+    print("="*50 ,"Local Distillation Phase", "="*50)
+    global_knowledge = server.get_global_knowledge(subset)
+    for client in clients:
+        print("-"*30 ,"Client {} knowledge distillation".format(client.id), "-"*30)
+        client.distillation(subset, global_knowledge) #FedD2P
+        #client.distillation(subset, server.agg_soft_label) #FedMD
+        #client.preparation(subset) #Local
+
+    print("="*50 ,"Local Training Phase", "="*50)
+    for client in clients:
+        print("-"*30 ,"Client {} local training".format(client.id), "-"*30)
+        client.local_training()
+
+
+
+S = [client.Acc for client in clients]
+
+with open("S.pkl", "wb") as file:
+    pickle.dump(S, file)
