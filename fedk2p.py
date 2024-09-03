@@ -19,8 +19,8 @@ import torch.nn as nn
 import keras
 import matplotlib.pyplot as plt
 from torch.optim.lr_scheduler import CosineAnnealingLR
-from PIL import Image
-import pickle
+#from PIL import Image
+#import pickle
 
 
 torch.manual_seed(42)
@@ -399,5 +399,5 @@ for round in range(rounds):
 
 S = [client.Acc for client in clients]
 
-with open("S.pkl", "wb") as file:
-    pickle.dump(S, file)
+#with open("S.pkl", "wb") as file:
+  #  pickle.dump(S, file)
