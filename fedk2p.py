@@ -7,7 +7,6 @@ Original file is located at
     https://colab.research.google.com/drive/1UDKO09tCO953ylGrSTy0ZyhN3-TCvquJ
 """
 
-from Arrow import pyarrow
 import numpy as np
 import pandas as pd
 import transformers
